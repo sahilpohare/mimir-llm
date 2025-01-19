@@ -1,0 +1,33 @@
+{
+  "name": "mimirllm",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start:node": "tsx listener/src/listener.ts",
+    "start:client": "tsx dialer/src/dialer.ts"
+  },
+  "dependencies": {
+    "@api/ollama": "file:.api/apis/ollama",
+    "@chainsafe/libp2p-noise": "latest",
+    "@chainsafe/libp2p-yamux": "latest",
+    "@libp2p/bootstrap": "latest",
+    "@libp2p/identify": "latest",
+    "@libp2p/kad-dht": "^14.2.0",
+    "@libp2p/mdns": "latest",
+    "@libp2p/tcp": "latest",
+    "@multiformats/multiaddr": "^12.3.4",
+    "it-length-prefixed": "^9.1.0",
+    "it-map": "^3.1.1",
+    "it-pipe": "^3.0.1",
+    "libp2p": "^2.3.1",
+    "node-fetch": "^3.3.2",
+    "openai": "^4.79.1",
+    "p-defer": "^4.0.1",
+    "uint8arrays": "^5.1.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.0",
+    "tsx": "^4.19.2",
+    "typescript": "~5.7.2"
+  }
+}

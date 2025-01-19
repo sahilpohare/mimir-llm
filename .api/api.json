@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "apis": [
+    {
+      "identifier": "ollama",
+      "source": "https://raw.githubusercontent.com/openai/openai-openapi/refs/heads/master/openapi.yaml",
+      "integrity": "sha512-OiBzTKMBqFWyswoA/zp2rihrGI8RlSA/3i83ogcBpSoJMjR91ibFh0jZW5N47pcjGenhB42khecas520/dxwpg==",
+      "installerVersion": "6.1.2"
+    }
+  ]
+}
