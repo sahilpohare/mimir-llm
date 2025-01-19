@@ -43,20 +43,32 @@ export interface LLMPeer {
 
 type OllamaChatCompletionRequest = Omit<OpenAI.ChatCompletionCreateParams, 'model'>;
 
+export interface MimirConfig {
+    mode: 'client' | 'node';
+    openaiConfig: {
+        apiKey?: string;
+        baseUrl: string;
+    };
+    protocol?: string;
+    openAIClient?: OpenAI;
+}
+
 export class MimirP2PClient {
     private llmPeerMap: Set<LLMPeer> = new Set();
-    private peerStreams: Map<string, Stream> = new Map();
     private requests: Map<string, string> = new Map();
+    private protocol: string;
+    private llm: OpenAI;
 
     constructor(
         private libp2p: Libp2p,
-        private mode: 'client' | 'node' = 'client',
-        private protocol: string = '/mimirllm/1.0.0',
-        private llm: OllamaClient = new OllamaClient()
-    ) { }
+        private config: MimirConfig,
+    ) {
+        this.protocol = config.protocol || '/mimirllm/1.0.0';
+        this.llm = config.openAIClient || new OllamaClient(config.openaiConfig.baseUrl, config.openaiConfig.apiKey);
+    }
 
     async start() {
-        if (this.mode === 'client') {
+        if (this.config.mode === 'client') {
             this.libp2p.addEventListener('peer:discovery', this.onDiscovery.bind(this));
         }
 
@@ -66,12 +78,12 @@ export class MimirP2PClient {
         console.log(`Node listening on:`);
         this.libp2p.getMultiaddrs().forEach((ma) => console.log(ma.toString()));
 
-        if (this.mode === 'node') {
-            this.libp2p.handle(this.protocol, this.handleProtocol.bind(this));
-            this.libp2p.handle(this.protocol + '/identify', this.handleIdentify.bind(this));
+        if (this.config.mode === 'node') {
+            this.libp2p.handle(this.config.protocol, this.handleProtocol.bind(this));
+            this.libp2p.handle(this.config.protocol + '/identify', this.handleIdentify.bind(this));
         }
 
-        if (this.mode === 'node') {
+        if (this.config.mode === 'node') {
             await this.advertiseLLM();
         }
 
@@ -259,7 +271,7 @@ export class MimirP2PClient {
 
         try {
             const fullMultiaddr = `${ma}/p2p/${peerId.toString()}`;
-            stream = await this.libp2p.dialProtocol(multiaddr(fullMultiaddr), this.protocol + '/identify');
+            stream = await this.libp2p.dialProtocol(multiaddr(fullMultiaddr), this.config.protocol + '/identify');
             this.requests.set(request_id, fullMultiaddr);
 
             await this.sendToStream(stream, {
@@ -321,7 +333,7 @@ export class MimirP2PClient {
 
         console.log('Dialing peer:', peerId.toString(), ma);
         try {
-            stream = await this.libp2p.dialProtocol(multiaddr(`${ma}/p2p/${peerId.toString()}`), this.protocol);
+            stream = await this.libp2p.dialProtocol(multiaddr(`${ma}/p2p/${peerId.toString()}`), this.config.protocol);
         } catch (error) {
             console.error('Failed to dial peer:', error);
             if (stream) {
