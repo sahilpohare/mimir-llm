@@ -1,347 +1,356 @@
-import { createInterface } from "readline";
-import { stdin } from "process";
-import { Connection, IncomingStreamData, Peer, PeerId, PeerInfo, Stream } from "@libp2p/interface";
-import { pipe } from "it-pipe";
-import * as lp from "it-length-prefixed";
-import map from "it-map";
-import { toString as uint8ArrayToString } from "uint8arrays/to-string";
-import { fromString as uint8ArrayFromString } from "uint8arrays/from-string";
-import { multiaddr } from "@multiformats/multiaddr";
-import { Libp2p } from "libp2p";
-import { randomUUID } from "crypto";
-import { CID } from "multiformats";
-import OpenAI from "openai";
-import { OllamaClient } from "./ollama";
-import { ChatCompletionChunk } from "openai/resources";
+import { IncomingStreamData, PeerId, PeerInfo } from '@libp2p/interface'
+import { multiaddr } from '@multiformats/multiaddr'
+import { Libp2p } from 'libp2p'
+import { CID } from 'multiformats'
+import { pipe } from 'it-pipe'
+import { PeerScheduler } from '../scheduler'
 
-export const llmCidMap = {
-    'llama3.2:latest': 'QmNizEt5WLyEDUHMqsm89RHHNR63DYUSdtS38AeG4XUV6C'
+// ---------------------------------------------------------------------------
+// Model registry
+// ---------------------------------------------------------------------------
+
+export const llmCidMap: Record<string, string> = {
+    'llama3.2:latest': 'QmNizEt5WLyEDUHMqsm89RHHNR63DYUSdtS38AeG4XUV6C',
 }
 
-// type of keys in llmCidMap
-export type LlmModel = keyof typeof llmCidMap;
+export type LlmModel = keyof typeof llmCidMap
 
-export interface MimirPacket<
-    T = LLMPacket | string | OllamaChatCompletionRequest | OpenAI.ChatCompletion | Array<LlmModel> | null | OpenAI.ChatCompletionChunk
-> {
-    event: 'message' | 'command' | 'query' | 'response' | 'completionStart' | 'completionPacket' | 'completionStop'
-    request_id?: string;
-    data: T;
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Sanitise a model name into a valid libp2p protocol string segment. */
+export function modelToProtocol(model: string): string {
+    return `/mimir/${model.replace(/[^a-zA-Z0-9._-]/g, '-')}/1.0.0`
 }
 
-export interface LLMPacket {
-    model: string;
-    created_at: Date;
-    response: string;
-    done: boolean;
+async function getPeerMultiaddr(libp2p: Libp2p, peerId: PeerId): Promise<string | null> {
+    try {
+        const peer = await libp2p.peerStore.get(peerId)
+        if (!peer.addresses.length) return null
+        return `${peer.addresses[0].multiaddr.toString()}/p2p/${peerId.toString()}`
+    } catch {
+        return null
+    }
 }
 
-export interface LLMPeer {
-    peerId: PeerId;
-    llmCID: CID;
+// ---------------------------------------------------------------------------
+// MimirNode — proxies libp2p streams to a local Ollama instance
+// ---------------------------------------------------------------------------
+
+export interface MimirNodeConfig {
+    ollamaUrl?: string
 }
 
-type OllamaChatCompletionRequest = Omit<OpenAI.ChatCompletionCreateParams, 'model'>;
-
-export interface MimirConfig {
-    mode: 'client' | 'node';
-    openaiConfig: {
-        apiKey?: string;
-        baseUrl: string;
-    };
-    protocol?: string;
-    openAIClient?: OpenAI;
-}
-
-export class MimirP2PClient {
-    private llmPeerMap: Set<LLMPeer> = new Set();
-    private requests: Map<string, string> = new Map();
-    private protocol: string;
-    private llm: OpenAI;
+export class MimirNode {
+    private readonly ollamaUrl: string
 
     constructor(
-        private libp2p: Libp2p,
-        private config: MimirConfig,
+        private readonly libp2p: Libp2p,
+        config: MimirNodeConfig = {},
     ) {
-        this.protocol = config.protocol || '/mimirllm/1.0.0';
-        this.llm = config.openAIClient || new OllamaClient(config.openaiConfig.baseUrl, config.openaiConfig.apiKey);
+        this.ollamaUrl = (config.ollamaUrl ?? 'http://localhost:11434').replace(/\/v1\/?$/, '')
     }
 
-    async start() {
-        if (this.config.mode === 'client') {
-            this.libp2p.addEventListener('peer:discovery', this.onDiscovery.bind(this));
-        }
-
-        this.libp2p.addEventListener('peer:connect', this.onPeerConnect.bind(this));
-        this.libp2p.addEventListener('peer:disconnect', this.onDisconnect.bind(this));
-
-        console.log(`Node listening on:`);
-        this.libp2p.getMultiaddrs().forEach((ma) => console.log(ma.toString()));
-
-        if (this.config.mode === 'node') {
-            this.libp2p.handle(this.config.protocol, this.handleProtocol.bind(this));
-            this.libp2p.handle(this.config.protocol + '/identify', this.handleIdentify.bind(this));
-        }
-
-        if (this.config.mode === 'node') {
-            await this.advertiseLLM();
-        }
-
-        await this.libp2p.start();
+    async start(): Promise<void> {
+        await this.libp2p.start()
+        await this.registerModels()
+        console.log('MimirNode started on:')
+        this.libp2p.getMultiaddrs().forEach((ma) => console.log(' ', ma.toString()))
     }
 
-    onDisconnect(
-        evt: CustomEvent<PeerId>
-    ) {
-        const peerId = evt.detail;
-        console.log('\nDisconnected from Peer:', peerId.toString());
-
-        this.llmPeerMap.forEach((peer) => {
-            if (peer.peerId.equals(peerId)) {
-                this.llmPeerMap.delete(peer);
-            }
-        });
-    }
-
-    // This method is used to query peers that are hosting specific LLMs
-    async queryPeers(llmCID: string) {
-        // const providers = this.libp2p.contentRouting.findProviders(
-        //     CID.parse(llmCID), {
-        //     useCache: true,
-        //     useNetwork: true
-        // });
-
-        // const results = [];
-        // for await (const provider of providers) {
-        //     const peerId = provider.id.toString();
-        //     results.push(peerId);
-        //     this.llmPeerMap.add({
-        //         peerId,
-        //         llmCID: CID.parse(llmCID)
-        //     });
-        // }
-        // return results;
-    }
-
-    async handleIdentify({ connection, stream }: IncomingStreamData) {
-        for await (const msg of this.receiveFromStream(stream)) {
-            if (msg.event === 'query') {
-                console.log('Query from peer:', msg.data);
-                await this.sendToStream(stream, {
-                    event: 'response',
-                    request_id: msg.request_id,
-                    data: ['llama3.2:latest']
-                } as MimirPacket<Array<LlmModel>>);
-            }
-        }
-    }
-
-    async handleProtocol({ connection, stream }: IncomingStreamData) {
-        for await (const msg of this.receiveFromStream(stream)) {
-            if (msg.event === 'message') {
-                this.handleMessage(
-                    connection,
-                    stream,
-                    msg as MimirPacket<OllamaChatCompletionRequest>
-                );
-            }
-        }
-    }
-
-    async sendMessage(
-        request: OllamaChatCompletionRequest
-    ): Promise<Stream> {
-        console.log('Sending message:', request);
-        if (this.llmPeerMap.size === 0) {
-            console.log('No peers available to send message to.');
-            return;
-        }
-
-        const llmPeer = Array.from(this.llmPeerMap).filter((peer) => peer.llmCID.toString() === llmCidMap["llama3.2:latest"])[0];
-
-        console.log(this.llmPeerMap);
-        console.log(llmPeer);
-
-        const stream = await this.dialPeer(llmPeer.peerId);
-
-        await this.sendToStream(stream, {
-            event: 'message',
-            data: request
-        } as MimirPacket<OllamaChatCompletionRequest>);
-
-        return stream;
-    }
-
-    private async handleMessage(conn: Connection, stream: Stream, msg: MimirPacket<OllamaChatCompletionRequest>) {
-        const { data } = msg;
-
-        console.log('Received message:', data);
-        const llmRequest = {
-            ...data,
-            model: 'llama3.2:latest',
-            stream: true
-        } as OpenAI.ChatCompletionCreateParamsStreaming;
-
-        const res = await this.llm.chat.completions.create(llmRequest);
-
-        pipe(
-            res,
-            (source) => map(source, (data) => ({
-                event: 'completionPacket',
-                data: data
-            }) as MimirPacket<ChatCompletionChunk>),
-            (source) => map(source, (data) => JSON.stringify(data)),
-            (source) => map(source, (string) => uint8ArrayFromString(string)),
-            lp.encode,
-            stream.sink
-        )
-    }
-
-    private onPeerConnect(event: CustomEvent<PeerId>) {
-        const peerId = event.detail;
-        // console.log('\nConnected to Peer:', peerId.toString());
-        // console.log('\nExpecting messages from peer... you can type now.');
-    }
-
-    private async onDiscovery(event: CustomEvent<PeerInfo>) {
-        const peerInfo = event.detail;
-        console.log('Discovered:', peerInfo.id.toString());
-
+    private async registerModels(): Promise<void> {
+        let models: string[]
         try {
-            await this.dialDiscovery(
-                peerInfo.id,
-                llmCidMap['llama3.2:latest']
-            )
-        } catch (error) {
-            console.error('Failed to dial peer:', error);
+            const res = await fetch(`${this.ollamaUrl}/api/tags`)
+            const json = await res.json() as { models: { name: string }[] }
+            models = json.models.map((m) => m.name)
+        } catch (err) {
+            console.error('Failed to fetch models from Ollama:', err)
+            return
+        }
+
+        for (const model of models) {
+            const cid = llmCidMap[model]
+            const protocol = modelToProtocol(model)
+
+            this.libp2p.handle(protocol, (data) => this.handleStream(data, model))
+            console.log('Registered protocol:', protocol)
+
+            if (cid) {
+                // Non-blocking — provide() can take a long time on sparse networks
+                this.libp2p.contentRouting.provide(CID.parse(cid))
+                    .then(() => console.log('Advertising via DHT:', model))
+                    .catch((err: any) => {
+                        if (err?.type !== 'aborted') console.error('DHT provide failed for', model, err)
+                    })
+            }
         }
     }
 
-    private async advertiseLLM() {
-        // advertise the LLM to the network
-        // so that other peers can query it
-
-        const models = await this.llm.models.list();
-        console.log('Advertised models:', models);
-
-        const llmCIDs = ['QmNizEt5WLyEDUHMqsm89RHHNR63DYUSdtS38AeG4XUV6C'];
-
-        for (const llmCID of llmCIDs) {
-            this.libp2p.contentRouting.provide(CID.parse(llmCID));
+    private async handleStream({ stream }: IncomingStreamData, model: string): Promise<void> {
+        // Read the full HTTP request from the libp2p stream
+        const chunks: Uint8Array[] = []
+        for await (const chunk of stream.source) {
+            chunks.push(chunk instanceof Uint8Array ? chunk : chunk.slice())
         }
-        // models.
-    }
 
-    private async sendToStream(stream: Stream, data: MimirPacket): Promise<void> {
-        const dataString = JSON.stringify(data);
+        const requestBytes = mergeChunks(chunks)
+        if (!requestBytes.length) return // probe dial — no request body
 
-        console.log('Sending:', dataString);
-        console.log('Stream:', stream.status);
+        const { method, path, headers, body } = parseHttpRequest(requestBytes)
+
+        // Rewrite the request to target the local Ollama instance
+        const url = `${this.ollamaUrl}${path}`
+        let ollamaRes: Response
+        try {
+            ollamaRes = await fetch(url, { method, headers, body: body.length ? body : undefined })
+        } catch (err) {
+            console.error('Ollama request failed:', err)
+            await stream.close()
+            return
+        }
+
+        // Stream the raw HTTP response back
+        const statusLine = `HTTP/1.1 ${ollamaRes.status} ${ollamaRes.statusText}\r\n`
+        const responseHeaders = [...ollamaRes.headers.entries()]
+            .map(([k, v]) => `${k}: ${v}`)
+            .join('\r\n')
+        const headerBytes = encoder.encode(`${statusLine}${responseHeaders}\r\n\r\n`)
 
         await pipe(
-            [dataString],
-            (source) => map(source, (string) => uint8ArrayFromString(string)),
-            lp.encode,
-            stream.sink
-        );
+            (async function* () {
+                yield headerBytes
+                if (ollamaRes.body) {
+                    const reader = ollamaRes.body.getReader()
+                    while (true) {
+                        const { done, value } = await reader.read()
+                        if (done) break
+                        yield value
+                    }
+                }
+            })(),
+            stream.sink,
+        )
+    }
+}
 
-        console.log('Sent:', dataString);
+// ---------------------------------------------------------------------------
+// MimirClient — discovers peers, routes requests, exposes tunneled fetch
+// ---------------------------------------------------------------------------
+
+export interface MimirClientConfig {
+    discoveryTimeoutMs?: number
+}
+
+export class MimirClient {
+    // model name → set of peerIds that have it
+    private readonly peersByModel: Map<string, Set<PeerId>> = new Map()
+    private readonly scheduler = new PeerScheduler()
+    private readonly discoveryTimeoutMs: number
+
+    constructor(
+        private readonly libp2p: Libp2p,
+        config: MimirClientConfig = {},
+    ) {
+        this.discoveryTimeoutMs = config.discoveryTimeoutMs ?? 5_000
     }
 
-    private async *receiveFromStream(stream: Stream): AsyncGenerator<MimirPacket> {
-        yield* pipe(
-            stream.source,
-            lp.decode,
-            (source) => map(source, (buf) => uint8ArrayToString(buf.subarray())),
-            async function* (source) {
-                for await (const msg of source) {
-                    console.log('Received:', msg);
-                    yield JSON.parse(msg) as MimirPacket;
-                }
+    async start(): Promise<void> {
+        this.libp2p.addEventListener('peer:discovery', this.onDiscovery.bind(this))
+        this.libp2p.addEventListener('peer:disconnect', this.onDisconnect.bind(this))
+        await this.libp2p.start()
+        console.log('MimirClient started on:')
+        this.libp2p.getMultiaddrs().forEach((ma) => console.log(' ', ma.toString()))
+
+        for (const [model, cid] of Object.entries(llmCidMap)) {
+            this.queryDHT(model, cid).catch((err) => console.error('DHT query failed:', err))
+        }
+    }
+
+    /**
+     * Returns a fetch() function that tunnels HTTP requests through a libp2p
+     * stream to the best available peer for the given model.
+     *
+     * Pass this to OllamaClient as the fetchFn parameter.
+     */
+    fetchFor(model: string): typeof fetch {
+        return async (input: RequestInfo | URL, init?: RequestInit) => {
+            const peers = this.peersByModel.get(model)
+            if (!peers?.size) throw new Error(`No peers available for model: ${model}`)
+
+            const peerId = this.scheduler.pick(peers)
+            if (!peerId) throw new Error('Scheduler returned no peer')
+
+            const done = this.scheduler.begin(peerId)
+            const t0 = Date.now()
+
+            const protocol = modelToProtocol(model)
+            const stream = await this.dial(peerId, protocol)
+            if (!stream) {
+                done(Date.now() - t0)
+                throw new Error(`Failed to dial peer ${peerId.toString()} for ${protocol}`)
             }
-        );
-    }
 
-    async dialDiscovery(peerId: PeerId, llmCID: string) {
-        let stream: Stream | null = null;
-        const request_id = randomUUID();
-
-        const peer = await this.libp2p.peerStore.get(peerId);
-        const ma = peer.addresses[0].multiaddr.toString();
-
-        try {
-            const fullMultiaddr = `${ma}/p2p/${peerId.toString()}`;
-            stream = await this.libp2p.dialProtocol(multiaddr(fullMultiaddr), this.config.protocol + '/identify');
-            this.requests.set(request_id, fullMultiaddr);
-
-            await this.sendToStream(stream, {
-                event: 'query',
-                request_id,
-                data: llmCID
-            });
-
-            const timeout = new Promise<null>((_, reject) => setTimeout(async () => {
-                if (this.requests.has(request_id)) {
-                    this.requests.delete(request_id);
-                    if (stream && stream.status !== 'closed') {
-                        await stream.close();
-                        console.log('Disconnected peer due to timeout:', peerId.toString());
-                    }
-                    reject(new Error('Timeout waiting for response'));
+            try {
+                // Serialise the fetch request into raw HTTP/1.1 bytes
+                const url = typeof input === 'string' ? new URL(input) : input instanceof URL ? input : new URL(input.url)
+                const method = init?.method ?? 'POST'
+                const body = init?.body ? new Uint8Array(await new Response(init.body).arrayBuffer()) : null
+                const reqHeaders: Record<string, string> = {
+                    'Host': url.host,
+                    'Connection': 'close',
+                    ...(body ? { 'Content-Length': String(body.byteLength) } : {}),
+                    ...(init?.headers ? Object.fromEntries(new Headers(init.headers as HeadersInit).entries()) : {}),
                 }
-            }, 5000));
 
-            const response = (async () => {
-                for await (const msg of this.receiveFromStream(stream!)) {
-                    if (msg.event === 'response' && this.requests.has(msg.request_id)) {
-                        const data = msg.data as Array<LlmModel>;
-                        this.requests.delete(msg.request_id);
+                const headerStr = Object.entries(reqHeaders).map(([k, v]) => `${k}: ${v}`).join('\r\n')
+                const requestLine = `${method} ${url.pathname}${url.search} HTTP/1.1\r\n${headerStr}\r\n\r\n`
+                const requestLineBytes = encoder.encode(requestLine)
 
-                        for (const model of data) {
-                            const llmCID = llmCidMap[model];
-                            if (llmCID) {
-                                this.llmPeerMap.add({
-                                    peerId,
-                                    llmCID: CID.parse(llmCID)
-                                });
+                await pipe(
+                    (async function* () {
+                        yield requestLineBytes
+                        if (body) yield body
+                    })(),
+                    stream.sink,
+                )
 
-                                console.log("Peer added to llmPeerMap:", peerId);
-                                console.log("llmPeerMap:", this.llmPeerMap);
-                            }
-                        }
-                    }
-                    stream.close();
-                    break;
+                // Read the raw HTTP response from the stream
+                const responseChunks: Uint8Array[] = []
+                for await (const chunk of stream.source) {
+                    responseChunks.push(chunk instanceof Uint8Array ? chunk : chunk.slice())
                 }
-            })();
 
-        } catch (error) {
-            console.error('Failed to dial peer:', error);
-            if (stream && stream.status !== 'closed') {
-                await stream.close();
-                console.log('Disconnected peer due to error:', peerId);
+                done(Date.now() - t0)
+
+                const responseBytes = mergeChunks(responseChunks)
+                return parseHttpResponse(responseBytes)
+            } catch (err) {
+                done(Date.now() - t0)
+                throw err
             }
         }
     }
 
-    private async dialPeer(peerId: PeerId): Promise<Stream | null> {
-        let stream: Stream | null = null;
-        const request_id = randomUUID();
-
-        const peer = await this.libp2p.peerStore.get(peerId);
-        const ma = peer.addresses[0].multiaddr.toString();
-
-        console.log('Dialing peer:', peerId.toString(), ma);
-        try {
-            stream = await this.libp2p.dialProtocol(multiaddr(`${ma}/p2p/${peerId.toString()}`), this.config.protocol);
-        } catch (error) {
-            console.error('Failed to dial peer:', error);
-            if (stream) {
-                await stream.close();
-                console.log('Disconnected peer due to error:', peerId);
+    private onDisconnect(evt: CustomEvent<PeerId>): void {
+        const peerId = evt.detail
+        console.log('Disconnected from peer:', peerId.toString())
+        this.scheduler.remove(peerId)
+        for (const peers of this.peersByModel.values()) {
+            for (const p of peers) {
+                if (p.equals(peerId)) peers.delete(p)
             }
         }
-
-        return stream;
     }
+
+    private async onDiscovery(evt: CustomEvent<PeerInfo>): Promise<void> {
+        const { id } = evt.detail
+        console.log('Discovered peer:', id.toString())
+        await this.probeModels(id)
+    }
+
+    private async queryDHT(model: string, cid: string): Promise<void> {
+        try {
+            for await (const provider of this.libp2p.contentRouting.findProviders(CID.parse(cid))) {
+                const peerId = provider.id
+                if (!this.hasPeer(model, peerId)) {
+                    console.log('Found provider via DHT:', peerId.toString(), 'for', model)
+                    this.addPeer(model, peerId)
+                }
+            }
+        } catch (err) {
+            console.error('queryDHT unavailable:', err)
+        }
+    }
+
+    /**
+     * Probe which models a peer supports by attempting dialProtocol for each
+     * known model. If the dial succeeds, the peer has that model.
+     */
+    private async probeModels(peerId: PeerId): Promise<void> {
+        for (const model of Object.keys(llmCidMap)) {
+            const protocol = modelToProtocol(model)
+            try {
+                const stream = await this.libp2p.dialProtocol(
+                    multiaddr((await getPeerMultiaddr(this.libp2p, peerId))!),
+                    protocol,
+                )
+                await stream.close()
+                this.addPeer(model, peerId)
+            } catch {
+                // peer doesn't support this model — expected, not an error
+            }
+        }
+    }
+
+    private async dial(peerId: PeerId, protocol: string) {
+        const ma = await getPeerMultiaddr(this.libp2p, peerId)
+        if (!ma) return null
+        try {
+            return await this.libp2p.dialProtocol(multiaddr(ma), protocol)
+        } catch (err) {
+            console.error(`dial ${protocol} to ${peerId.toString()} failed:`, err)
+            return null
+        }
+    }
+
+    private addPeer(model: string, peerId: PeerId): void {
+        if (!this.peersByModel.has(model)) this.peersByModel.set(model, new Set())
+        this.peersByModel.get(model)!.add(peerId)
+        this.scheduler.register(peerId)
+        console.log('Peer registered for model', model, '→', peerId.toString())
+    }
+
+    private hasPeer(model: string, peerId: PeerId): boolean {
+        return Array.from(this.peersByModel.get(model) ?? []).some((p) => p.equals(peerId))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw HTTP helpers
+// ---------------------------------------------------------------------------
+
+const encoder = new TextEncoder()
+const decoder = new TextDecoder()
+
+function mergeChunks(chunks: Uint8Array[]): Uint8Array {
+    const total = chunks.reduce((n, c) => n + c.byteLength, 0)
+    const out = new Uint8Array(total)
+    let offset = 0
+    for (const c of chunks) { out.set(c, offset); offset += c.byteLength }
+    return out
+}
+
+function parseHttpRequest(bytes: Uint8Array): {
+    method: string; path: string; headers: Record<string, string>; body: Uint8Array
+} {
+    const raw = decoder.decode(bytes)
+    const headerEnd = raw.indexOf('\r\n\r\n')
+    const headerSection = raw.slice(0, headerEnd)
+    const lines = headerSection.split('\r\n')
+    const [method, path] = lines[0].split(' ')
+    const headers: Record<string, string> = {}
+    for (const line of lines.slice(1)) {
+        const colon = line.indexOf(':')
+        if (colon !== -1) headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim()
+    }
+    const body = bytes.slice(encoder.encode(raw.slice(0, headerEnd + 4)).byteLength)
+    return { method, path, headers, body }
+}
+
+function parseHttpResponse(bytes: Uint8Array): Response {
+    const raw = decoder.decode(bytes)
+    const headerEnd = raw.indexOf('\r\n\r\n')
+    const headerSection = raw.slice(0, headerEnd)
+    const lines = headerSection.split('\r\n')
+    const statusMatch = lines[0].match(/HTTP\/\S+ (\d+)/)
+    const status = statusMatch ? parseInt(statusMatch[1]) : 200
+    const headers = new Headers()
+    for (const line of lines.slice(1)) {
+        const colon = line.indexOf(':')
+        if (colon !== -1) headers.append(line.slice(0, colon).trim(), line.slice(colon + 1).trim())
+    }
+    const bodyBytes = bytes.slice(encoder.encode(raw.slice(0, headerEnd + 4)).byteLength)
+    return new Response(bodyBytes, { status, headers })
 }

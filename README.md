@@ -1,138 +1,189 @@
 
 # MimirLLM
 
-MimirLLM is a library that facilitates peer-to-peer communication for AI-driven language models using libp2p. It supports querying available models, sending messages, and receiving responses from peers hosting LLMs (Large Language Models). It is designed to operate in either client or node mode, enabling both lightweight clients and full-service nodes in the network.
+MimirLLM is a peer-to-peer transport layer for LLM inference. It handles discovery, routing, scheduling, and tunnelling — the OpenAI SDK does everything else. Any Ollama-compatible client works transparently; Mimir is invisible to application code.
 
-This is a proof-of-concept implementation and is not intended for production use. It is part of the Mimir project, a decentralized AI platform that aims to democratize access to AI models and data.
+This is a proof-of-concept and is not intended for production use. It is part of the Mimir project, a decentralized AI platform that aims to democratize access to AI models.
 
-## Features
-- **Peer Discovery:** Automatically discovers peers in the network and connects to them.
-- **LLM Advertisement:** Nodes can advertise hosted LLMs to the network.
-- **Message Handling:** Supports sending and receiving structured messages for LLM interactions.
-- **Protocol Management:** Uses a custom protocol (/mimirllm/1.0.0) for communication.
-- **OpenAI and Custom Models:** Integrates with OpenAI API or custom implementations like Ollama.
+## Architecture
 
-## How the protocol operates
-The protocol is divied into two main parts: the `Discovery` and the `LLM` part
+```mermaid
+flowchart TD
+    subgraph Client Machine
+        APP[Application\nOpenAI SDK]
+        MC[MimirClient\nfetchFor / scheduler]
+    end
 
-### Discovery and Handshake `/mimirllm/1.0.0/identify`
-The Discovery part is responsible for finding peers in the network and connecting to them. It uses the `/mimirllm/1.0.0/identify` protocol to exchange information about the node. 
+    subgraph Network
+        MDNS[mDNS\nLAN discovery]
+        DHT[Kademlia DHT\nWAN discovery]
+    end
 
-1. The client sends a `query` event to the node and the node responds with the `models` it has access to. 
-2. The once successful, the client then stores the node's information into an internal list of known nodes.
+    subgraph Node Machine
+        MN[MimirNode\nHTTP proxy]
+        OLLAMA[Ollama\nlocalhost:11434]
+    end
 
-### LLM Interaction `/mimirllm/1.0.0` 
-The LLM is responsible for the actual interaction with the LLM. It uses the `/mimirllm/1.0.0` protocol to exchange messages with the LLM.
+    APP -->|standard fetch calls| MC
+    MC -->|peer scoring\nload balancing| MC
+    MC <-->|peer:discovery events| MDNS
+    MC <-->|findProviders / provide| DHT
+    MN <-->|provide CID per model| DHT
+    MN <-->|mDNS announce| MDNS
+    MC -->|raw HTTP/1.1\nlibp2p stream\n/mimir/model-name/1.0.0| MN
+    MN -->|HTTP proxy| OLLAMA
+    OLLAMA -->|SSE stream| MN
+    MN -->|raw HTTP response\nlibp2p stream| MC
+    MC -->|Response object| APP
+```
 
-1. When a client wants to interact with an LLM, it looks up the nodes serving the LLM CID and sends a `message` event to the node.
-   
-2.  The node then forwards the message to the LLM and returns the response to the client.
+## Sequence diagrams
+
+### Node startup & advertisement
+
+```mermaid
+sequenceDiagram
+    participant O as Ollama
+    participant N as MimirNode
+    participant D as DHT / mDNS
+
+    N->>O: GET /api/tags
+    O-->>N: [llama3.2:latest, ...]
+    loop each model
+        N->>N: handle(/mimir/<model>/1.0.0)
+        N->>D: provide(CID)
+        N->>D: mDNS announce
+    end
+```
+
+### Client discovery & capability probe
+
+```mermaid
+sequenceDiagram
+    participant C as MimirClient
+    participant D as DHT / mDNS
+    participant N as MimirNode
+
+    D-->>C: peer:discovery (peerId)
+    loop each known model
+        C->>N: dialProtocol(/mimir/<model>/1.0.0)
+        alt peer has model
+            N-->>C: stream opened → close
+            C->>C: addPeer(model, peerId)
+        else
+            N-->>C: protocol not supported
+        end
+    end
+```
+
+### Inference request
+
+```mermaid
+sequenceDiagram
+    participant A as Application (OpenAI SDK)
+    participant C as MimirClient (fetchFor)
+    participant N as MimirNode
+    participant O as Ollama
+
+    A->>C: fetch(POST /v1/chat/completions)
+    C->>C: pick best peer (scheduler)
+    C->>N: open stream /mimir/<model>/1.0.0
+    C->>N: raw HTTP/1.1 request bytes
+    N->>O: HTTP POST /v1/chat/completions
+    loop SSE chunks
+        O-->>N: data: {...}
+        N-->>C: raw HTTP response bytes
+    end
+    O-->>N: data: [DONE]
+    N-->>C: stream close
+    C-->>A: Response (SSE body)
+    A->>A: parse chunks, yield tokens
+```
+
+## How it works
+
+### Discovery
+
+Nodes advertise each locally available model as a CID on the Kademlia DHT and announce via mDNS. Clients find providers through both channels.
+
+### Capability probing
+
+When a client discovers a peer, it calls `dialProtocol` for each known model protocol (`/mimir/<model>/1.0.0`). A successful dial means the peer has that model. No handshake message needed — libp2p protocol negotiation does the work.
+
+### Tunnelled fetch
+
+`MimirClient.fetchFor(model)` returns a `fetch`-compatible function. Calling it:
+
+1. Picks the best peer via `PeerScheduler` (least active requests, lowest EWMA latency)
+2. Opens a libp2p stream using the model's protocol
+3. Serialises the HTTP request to raw HTTP/1.1 bytes and writes to the stream sink
+4. Reads the raw HTTP response from the stream source
+5. Returns a `Response` object — indistinguishable from a real HTTP response
+
+Pass this function to `OllamaClient` as the `fetchFn` parameter. The OpenAI SDK handles streaming, retries, and typed responses.
+
+### Node proxy
+
+`MimirNode` registers one libp2p protocol handler per model. On each incoming stream it:
+
+1. Reads the raw HTTP request bytes
+2. Rewrites the URL to target the local Ollama instance
+3. Pipes the Ollama SSE response back through the stream
+
+## Usage
+
+### Node
+
+```typescript
+import { createLibp2p } from 'libp2p'
+import libp2pConfig from './shared/libp2p'
+import { MimirNode } from './shared/mimir'
+
+const libp2p = await createLibp2p(libp2pConfig)
+const node = new MimirNode(libp2p, {
+    ollamaUrl: process.env.OLLAMA_ENDPOINT ?? 'http://localhost:11434',
+})
+await node.start()
+```
+
+### Client
+
+```typescript
+import { createLibp2p } from 'libp2p'
+import libp2pConfig from './shared/libp2p'
+import { MimirClient } from './shared/mimir'
+import { OllamaClient } from './shared/mimir/ollama'
+
+const libp2p = await createLibp2p(libp2pConfig)
+const mimir = new MimirClient(libp2p)
+await mimir.start()
+
+const model = 'llama3.2:latest'
+const openai = new OllamaClient('http://ignored/v1', null, mimir.fetchFor(model))
+
+const stream = await openai.chat.completions.create({
+    model,
+    stream: true,
+    messages: [{ role: 'user', content: 'Hello' }],
+})
+
+for await (const chunk of stream) {
+    process.stdout.write(chunk.choices[0]?.delta?.content ?? '')
+}
+```
 
 ## Installation
-
-### Requirements
-- Node.js v22.13.0 (LTS) or later (might work with older versions but not tested)
-- Ollama or OpenAI API key (optional)
-- IPFS node (optional)
 
 ```bash
 git clone <repo>
 cd <repo>
-
-# Install dependencies
-npm install
+bun install
 ```
 
-## Usage
-
-#### Node Mode
-```typescript
-// Node mode
-import { createLibp2p } from './createNode';
-import libp2pConfig from '../../shared/libp2p';
-import { MimirP2PClient } from '../../shared/mimir';
-
-createLibp2p(libp2pConfig).then(async (node) => {
-	console.log(`Node listening on:`);
-	node.getMultiaddrs().forEach((ma) => console.log(ma.toString()));
-
-	const mimir = new MimirP2PClient(node, {
-		mode: "node",
-		openaiConfig: {
-			baseUrl: process.env.OLLAMA_ENDPOINT
-		}
-	});
-	await mimir.start();
-}).catch((e) => {
-	console.error(e);
-});
-```
-
-#### Client Mode
-```typescript
-// Client mode
-import { createLibp2p, Libp2p } from "libp2p"
-import libp2pConfig from "../../shared/libp2p"
-import { MimirP2PClient, MimirPacket } from "../../shared/mimir";
-import { createInterface } from "readline";
-import { streamToConsole } from "../utils/stream";
-import { ChatCompletionChunk } from "openai/resources";
-
-async function main() {
-	const libp2p = await createLibp2p(libp2pConfig);
-	const client = new MimirP2PClient(libp2p, {
-		mode: "client",
-		openaiConfig: {
-			baseUrl: process.env.OLLAMA_ENDPOINT
-		}
-	});
-	await client.start();
-
-	while (true) {
-		const message = await new Promise<string>((resolve) => {
-			const readline = createInterface({
-				input: process.stdin,
-				output: process.stdout
-			})
-			readline.question('Enter message: ', (message) => {
-				readline.close();
-				resolve(message);
-			});
-		}
-		);
-
-		if (message === 'exit') {
-			break;
-		}
-
-		const stream = await client.sendMessage({
-			messages: [
-				{
-					"role": "system",
-					content: "You are a helpful assistant"
-				},
-				{
-					"role": "user",
-					content: message
-				}
-			]
-		});
-
-
-		streamToConsole(stream, (msg) => {
-			const data = JSON.parse(msg) as MimirPacket<ChatCompletionChunk>;
-			process.stdout.write(data.data.choices[0].delta.content);
-		});
-	}
-}
-
-main().catch((e) => {
-	console.error(e);
-});
-```
+Requires [Ollama](https://ollama.com) running locally on the node machines.
 
 ## Backlog
-- [ ] Implement a more robust discovery mechanism
-- [ ] Merge the two protocols into one
-- [ ] Make the peer querying more efficient
-- [ ] Turn this into a blockchain where nodes can be rewarded for hosting LLMs
+- [ ] Multi-hop routing (client → relay node → GPU node)
+- [ ] Token-based incentive layer for node operators
+- [ ] Request authentication / peer allowlists
+- [ ] Metrics endpoint (Prometheus)

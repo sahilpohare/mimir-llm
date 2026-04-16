@@ -1,18 +1,13 @@
-import { createLibp2p } from './createNode';
-import libp2pConfig from '../../shared/libp2p';
-import { MimirP2PClient } from '../../shared/mimir';
+import { createLibp2p } from 'libp2p'
+import libp2pConfig from '../../shared/libp2p'
+import { MimirNode } from '../../shared/mimir'
 
-createLibp2p(libp2pConfig).then(async (node) => {
-	console.log(`Node listening on:`);
-	node.getMultiaddrs().forEach((ma) => console.log(ma.toString()));
+async function main() {
+    const libp2p = await createLibp2p(libp2pConfig)
+    const node = new MimirNode(libp2p, {
+        ollamaUrl: process.env.OLLAMA_ENDPOINT ?? 'http://localhost:11434',
+    })
+    await node.start()
+}
 
-	const mimir = new MimirP2PClient(node, {
-		mode: "node",
-		openaiConfig: {
-			baseUrl: process.env.OLLAMA_ENDPOINT
-		}
-	});
-	await mimir.start();
-}).catch((e) => {
-	console.error(e);
-});
+main().catch(console.error)
